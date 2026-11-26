@@ -20,8 +20,6 @@
 //! `net_diag` 命令会输出 DNS/HTTP/环境变量快照。
 
 use crate::network_policy;
-use base64::engine::general_purpose::STANDARD as B64;
-use base64::Engine;
 use once_cell::sync::Lazy;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -483,21 +481,11 @@ pub async fn edge(
     {
         return Err("镜像线路仅供游客浏览；登录/注册请切换到固定线路".into());
     }
-    let (encoded, ctype) = match &body {
-        Some(v) => (
-            B64.encode(serde_json::to_vec(v).map_err(|e| e.to_string())?),
-            "application/json",
-        ),
-        None => (String::new(), ""),
-    };
-    let envelope = json!({
-        "method": method,
-        "path": path,
-        "body": encoded,
-        "content_type": ctype,
-    });
-
-    let url = format!("{cur}/api/edge/request");
+    // 直连模式：上游已停用 `POST /api/edge/request` 边缘信封（返回
+    // 503 "接口已停用"），但底层业务路由本身仍然可用且返回同样的
+    // `{data, status, msg, req_time}` 结构。因此这里不再封装信封，
+    // 直接把 method/path 打到真实路由上，响应解析无需改动。
+    let url = format!("{cur}{path}");
     let referer = format!("{cur}/");
     let token = token.map(|s| s.to_string());
 
@@ -517,11 +505,11 @@ pub async fn edge(
     let value = with_retry(can_retry, || {
         attempt += 1;
         let attempt = attempt;
-        let envelope = envelope.clone();
         let token = token.clone();
         let url = url.clone();
         let referer = referer.clone();
         let line_host = line_host.clone();
+        let body = body.clone();
         async move {
             let started = Instant::now();
             crate::playback_log::record("api.begin", json!({"request": request, "attempt": attempt, "operation": operation, "method": method, "line_host": line_host}));
@@ -536,10 +524,13 @@ pub async fn edge(
                     let (target, client) = client_for(next.as_str()).await?;
                     target_host = target.host_str().unwrap_or("").to_string();
                     let mut req = client
-                        .post(target.clone())
+                        .request(method.parse().map_err(|_| "不支持的请求方法")?, target.clone())
                         .header("Accept", "application/json")
-                        .header("Referer", &referer)
-                        .json(&envelope);
+                        .header("Referer", &referer);
+                    // 直连模式：有 body 就作为 JSON 请求体发出（不再 base64 封装到信封里）。
+                    if let Some(v) = &body {
+                        req = req.header("Content-Type", "application/json").json(v);
+                    }
                     if let Some(t) = token.as_deref() {
                         if !t.is_empty() {
                             req = req.header("Authorization", format!("Bearer {t}"));
