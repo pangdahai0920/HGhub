@@ -34,6 +34,8 @@ jobs:
         env:
           PLAYBACK_SCENARIOS: ${{ inputs.scenarios }}
         run: pnpm test:playback --scenarios "$PLAYBACK_SCENARIOS" --output test-results/playback-ci
+      - name: Run feed episode-slide checks（下滑=下一集）
+        run: pnpm test:feed --output test-results/feed-ci
       - name: Upload diagnostics even when a check fails
         if: always()
         uses: actions/upload-artifact@v4

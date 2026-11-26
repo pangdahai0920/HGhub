@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { api, cover, fmt, fmtTime, isMobile } from "../api";
-import type { Detail, Episode, Post, VideoCard } from "../types";
+import type { Detail, Episode, Post } from "../types";
 import { useStore } from "../store";
 import { Avatar, Img, Sheet } from "./ui";
 import VideoSurface, { type VideoHandle } from "./VideoSurface";
@@ -29,6 +29,47 @@ type Props = {
   startTime?: number;
 };
 
+/** 一屏滑片 = 某部短剧的某一集 */
+type Slide = { id: number; ep: number };
+
+/** 只渲染当前屏前后各 N 屏的内容，其余用等高空片占位（一部剧可能上百集） */
+const RENDER_RADIUS = 10;
+
+/**
+ * 把「短剧列表」摊平成「逐集滑片」。
+ * - 已展开的短剧：它的每一集各占一屏（按集数升序）；
+ * - 未展开的短剧：仍只占一屏，停在自己的定位集（默认第 1 集）。
+ * 展开只会往后面插滑片，当前正在看的那一屏不会错位。
+ */
+function buildDeck(
+  videoIds: number[],
+  details: Record<number, Detail>,
+  expanded: Set<number>,
+  anchor: Record<number, number>,
+): Slide[] {
+  const out: Slide[] = [];
+  for (const id of videoIds) {
+    const eps = expanded.has(id) ? details[id]?.episodes : undefined;
+    if (eps?.length) {
+      const nums = [...new Set(eps.map((e) => e.ep_num))].filter((n) => Number.isFinite(n) && n > 0).sort((a, b) => a - b);
+      if (nums.length) {
+        for (const ep of nums) out.push({ id, ep });
+        continue;
+      }
+    }
+    out.push({ id, ep: anchor[id] || 1 });
+  }
+  return out;
+}
+
+/** 当前滑片在 deck 里的位置；滑片暂时不在 deck 里时退回到同一部短剧的第一屏 */
+function findSlide(deck: Slide[], s: Slide): number {
+  const hit = deck.findIndex((x) => x.id === s.id && x.ep === s.ep);
+  if (hit >= 0) return hit;
+  const same = deck.findIndex((x) => x.id === s.id);
+  return same >= 0 ? same : 0;
+}
+
 export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind = "video", active, bottomInset, onBack, onNearEnd, startEp, startTime }: Props) {
   const store = useStore();
   const { isLiked, isFav, toggleLikeLocal, toggleFavLocal, toggleFollowLocal, muted, setMuted, volume, setVolume, toast, addHistory, user, setLoginOpen } = store;
@@ -36,12 +77,6 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
 
   const boxRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<VideoHandle>(null);
-  const [index, setIndex] = useState(startIndex);
-  const [epMap, setEpMap] = useState<Record<number, number>>(() => (startEp ? { [videoIds[startIndex]]: startEp } : {}));
-  const [details, setDetails] = useState<Record<number, Detail>>({});
-  const [playUrls, setPlayUrls] = useState<Record<string, string>>({});
-  const [cards] = useState<Record<number, VideoCard>>({});
-  const [posts, setPosts] = useState<Record<number, Post>>({});
 
   const [time, setTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -124,13 +159,69 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     mode: "idle" | "hold" | "scrub" | "pan"; base: number; width: number; playing: boolean;
   } | null>(null);
 
-  const curId = videoIds[index];
+  /* —— 逐集滑片 ——
+     唯一真相是「当前在看哪部短剧的第几集」，索引由它在 deck 里的位置推出来。
+     这样剧集展开/收起、首页追加视频都不会把画面错位到别的一集。 */
+  const [slide, setSlide] = useState<Slide>(() => ({
+    id: videoIds[startIndex] ?? 0,
+    ep: startEp && startEp > 0 ? startEp : 1,
+  }));
+  /* 已展开成逐集滑片的短剧 id */
+  const [expanded, setExpanded] = useState<Set<number>>(() => new Set());
+  /* 尚未展开的短剧先停在第几集（续播 / 选集定位用） */
+  const [anchor, setAnchor] = useState<Record<number, number>>(() => (
+    startEp && startEp > 0 && videoIds[startIndex] ? { [videoIds[startIndex]]: startEp } : {}
+  ));
+  const [details, setDetails] = useState<Record<number, Detail>>({});
+  const [playUrls, setPlayUrls] = useState<Record<string, string>>({});
+  const [posts, setPosts] = useState<Record<number, Post>>({});
+
+  /* videoIds 每次渲染都是新数组：用内容做 memo 键，避免 deck 白算 */
+  const idsKey = videoIds.join(",");
+  const vidsRef = useRef(videoIds);
+  vidsRef.current = videoIds;
+  const deck = useMemo(
+    () => buildDeck(vidsRef.current, details, expanded, anchor),
+    [idsKey, details, expanded, anchor],
+  );
+  const deckRef = useRef(deck);
+  deckRef.current = deck;
+  const index = useMemo(() => findSlide(deck, slide), [deck, slide]);
+  const indexRef = useRef(index);
+  indexRef.current = index;
+  const slideRef = useRef(slide);
+  slideRef.current = slide;
+  /* 标记「这次索引变化是用户滚出来的」，避免滚动同步把手势顶住 */
+  const userScrollRef = useRef(false);
+  /* 供事件回调 / 定时器读取最新值（避免闭包读到旧状态） */
+  const expandedRef = useRef(expanded);
+  expandedRef.current = expanded;
+  const detailsRef = useRef(details);
+  detailsRef.current = details;
+  const playUrlsRef = useRef(playUrls);
+  playUrlsRef.current = playUrls;
+  /* 在途请求去重：同一部剧的详情、同一集的播放地址只发一次 */
+  const detailReq = useRef(new Set<number>());
+  const playReq = useRef(new Set<string>());
+  /* 剧集还没展开时按下的「下一集」，等详情回来再补 */
+  const pendingAdvance = useRef(0);
+  /* 平滑滚动动画的截止时间（期间不要用 scrollTop 重对齐） */
+  const smoothUntil = useRef(0);
+  /* 「当前或正在滑向的那一屏」：连按翻页时以它为准。
+     不能只看 index —— 动画还没走完时 React 那边还是旧值，连按会被算成空操作。 */
+  const intentRef = useRef(index);
+
+  const cur = deck[index] ?? slide;
+  const curId = cur.id;
+  const curEp = cur.ep;
   const detail = details[curId];
-  const curEp = epMap[curId] || 1;
   const playKey = `${curId}:${curEp}`;
   const playUrl = playUrls[playKey] || "";
+  /* 当前短剧在来源列表里的位置（顶部「3 / 20」用） */
+  const posInVideos = Math.max(0, videoIds.indexOf(curId));
   useEffect(() => { videoRef.current?.trace("page.active", { active, view: mode, video_id: curId, episode: curEp }); }, [active, mode, curId, curEp]);
   const episodes = detail?.episodes || [];
+  const epCount = episodes.length;
   const post = posts[curId];
 
   /* 观看进度：onTime 里每 5 秒落一次；拖动进度条期间忽略底层 timeupdate 防止进度条回跳 */
@@ -174,16 +265,16 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
         episodes: [] as Episode[],
       }
     : {
-        title: detail?.title || cards[curId]?.title || "",
-        cover: detail?.cover || cards[curId]?.cover || "",
+        title: detail?.title || "",
+        cover: detail?.cover || "",
         desc: detail?.description || "",
         author: detail?.author?.name || "黄果短剧",
         authorId: detail?.author?.id || -1,
         tags: detail?.tags || [],
         score: detail?.score || 0,
-        like: detail?.counts?.like ?? cards[curId]?.like_count ?? 0,
-        comment: detail?.counts?.comment ?? cards[curId]?.comment_count ?? 0,
-        collect: detail?.counts?.collect ?? cards[curId]?.collect_count ?? 0,
+        like: detail?.counts?.like ?? 0,
+        comment: detail?.counts?.comment ?? 0,
+        collect: detail?.counts?.collect ?? 0,
         episodes: detail?.episodes || [],
       };
 
@@ -281,101 +372,196 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     }
   }, [isDesktop, fs, isLandscapeVideo]);
 
-  /* 全屏切换或视口旋转后校准滚动容器 scrollTop：
-     - 进入全屏时非当前项已隐藏，当前项位于顶部 scrollTop = 0；
-     - 退出全屏回到竖屏列表时，立即将 scrollTop 重新对齐到 index * clientHeight，防止错位到其它视频封面。 */
+  /* 滚动定位（全屏或缩放手势期间锁定索引，避免容器尺寸变化误触发翻页）。
+     用 rAF 合并高频 scroll 事件；只有「当前滑片」真的变了才更新状态。 */
+  const rafScrollRef = useRef(0);
+  const onScroll = useCallback(() => {
+    if (fs || pinchRef.current || rafScrollRef.current) return;
+    rafScrollRef.current = requestAnimationFrame(() => {
+      rafScrollRef.current = 0;
+      const el = boxRef.current;
+      if (!el) return;
+      const h = el.clientHeight || 1;
+      const list = deckRef.current;
+      if (!list.length) return;
+      const i = Math.max(0, Math.min(list.length - 1, Math.round(el.scrollTop / h)));
+      const s = list[i];
+      if (s && (s.id !== slideRef.current.id || s.ep !== slideRef.current.ep)) {
+        userScrollRef.current = true;   // 用户自己滚出来的索引变化，不要回写 scrollTop
+        intentRef.current = i;
+        setSlide(s);
+      }
+      if (onNearEnd && i >= list.length - 3) onNearEnd();
+    });
+  }, [fs, onNearEnd]);
+
+  /* 直接落位到某一屏（跨多集时不做平滑滚动，免得途经的每一集都去取播放地址） */
+  const jumpTo = useCallback((i: number) => {
+    const s = deckRef.current[i];
+    if (!s) return;
+    const el = boxRef.current;
+    if (el) el.scrollTop = i * (el.clientHeight || 1);
+    intentRef.current = i;
+    setSlide(s);
+  }, []);
+
+  const go = useCallback((delta: number) => {
+    const list = deckRef.current;
+    if (!list.length) return;
+    /* 连按翻页时上一屏可能还没提交索引，以「正在滑向的目标」为基准 */
+    const base = intentRef.current;
+    const i = Math.max(0, Math.min(list.length - 1, base + delta));
+    if (i === base) {
+      /* 这一屏暂时就是最后一块滑片：多半是剧集列表还没回来，先把这次「下一集」记下来 */
+      if (delta > 0) {
+        pendingAdvance.current = delta;
+        window.setTimeout(() => { pendingAdvance.current = 0; }, 2500);
+      }
+      return;
+    }
+    pendingAdvance.current = 0;
+    if (Math.abs(delta) > 1) { jumpTo(i); return; }
+    const el = boxRef.current;
+    if (el) {
+      intentRef.current = i;
+      smoothUntil.current = Date.now() + 700;
+      el.scrollTo({ top: i * (el.clientHeight || 1), behavior: "smooth" });
+    }
+  }, [jumpTo]);
+
+  /* 详情/剧集晚到时，补上刚才被吞掉的那次「下一集」 */
+  useEffect(() => {
+    const d = pendingAdvance.current;
+    if (!d) return;
+    const i = indexRef.current + d;
+    if (i >= deckRef.current.length) return;
+    pendingAdvance.current = 0;
+    jumpTo(i);
+  }, [deck, jumpTo]);
+
+  /* 滑片增删（剧集展开 / 首页追加视频）与全屏切换后，把 scrollTop 对齐到当前滑片：
+     - 进入全屏：其它屏已隐藏，scrollTop = 0；退出全屏：回到 index * clientHeight；
+     - 往前插入了滑片（续播 / 选集展开）：索引会变，重新对齐，画面不会落到别的集。
+     注意两种「不用管」的情况：用户自己滚出来的索引变化（否则手势会被顶回去）、
+     以及只是往后追加了滑片（当前这屏没动，正在进行的滚动动画不能被改写）。 */
+  const syncAnchor = useRef({ index: -1, fs, vp: vpLandscape });
+  useLayoutEffect(() => {
+    const el = boxRef.current;
+    if (!el) return;
+    const prev = syncAnchor.current;
+    syncAnchor.current = { index, fs, vp: vpLandscape };
+    if (userScrollRef.current) { userScrollRef.current = false; return; }
+    intentRef.current = index;   // 索引是被重排/全屏改掉的：之后翻页以新位置为准
+    const resized = prev.fs !== fs || prev.vp !== vpLandscape;
+    if (prev.index === index && !resized) return;
+    const h = el.clientHeight || 1;
+    const target = fs ? 0 : index * h;
+    if (Math.abs(el.scrollTop - target) > 1.5) el.scrollTop = target;
+  }, [index, fs, vpLandscape]);
+
+  /* 容器高度变化（窗口缩放、横竖屏切换、安全区变化）后重新对齐当前滑片。
+     只在高度真的变了、且没有正在进行的滚动动画时才动 scrollTop，
+     否则会把用户/程序刚发起的翻页直接顶回去。 */
   useEffect(() => {
     const el = boxRef.current;
     if (!el) return undefined;
-    if (fs) {
-      el.scrollTop = 0;
-      return undefined;
-    }
-    const syncScroll = () => {
-      const box = boxRef.current;
-      if (!box || fs) return;
-      box.scrollTop = index * (box.clientHeight || 1);
-    };
-    syncScroll();
-    const raf = requestAnimationFrame(syncScroll);
-    const t1 = window.setTimeout(syncScroll, 120);
-    const t2 = window.setTimeout(syncScroll, 350);
-    return () => {
-      cancelAnimationFrame(raf);
-      window.clearTimeout(t1);
-      window.clearTimeout(t2);
-    };
-  }, [fs, vpLandscape, index]);
-
-  /* 滚动定位（全屏或缩放手势期间锁定索引，避免容器尺寸变化误触发翻页） */
-  const onScroll = useCallback(() => {
-    if (fs || pinchRef.current) return;
-    const el = boxRef.current;
-    if (!el) return;
-    const h = el.clientHeight || 1;
-    const i = Math.max(0, Math.min(videoIds.length - 1, Math.round(el.scrollTop / h)));
-    setIndex((prev) => (prev === i ? prev : i));
-    if (onNearEnd && i >= videoIds.length - 3) onNearEnd();
-  }, [videoIds.length, onNearEnd, fs]);
-
-  const go = useCallback((delta: number) => {
-    const el = boxRef.current;
-    if (!el) return;
-    const next = Math.max(0, Math.min(videoIds.length - 1, index + delta));
-    el.scrollTo({ top: next * el.clientHeight, behavior: "smooth" });
-  }, [index, videoIds.length]);
-
-  /* 初始定位 */
-  useEffect(() => {
-    const el = boxRef.current;
-    if (!el) return;
-    const raf = requestAnimationFrame(() => {
-      el.scrollTop = startIndex * (el.clientHeight || 1);
+    let t = 0;
+    let lastH = 0;
+    const ro = new ResizeObserver(() => {
+      window.clearTimeout(t);
+      t = window.setTimeout(() => {
+        const box = boxRef.current;
+        if (!box || fs || pinchRef.current) return;
+        const h = box.clientHeight || 1;
+        if (h === lastH) return;
+        lastH = h;
+        if (Date.now() < smoothUntil.current) return;
+        if (Math.abs(box.scrollTop - indexRef.current * h) > 1.5) box.scrollTop = indexRef.current * h;
+      }, 80);
     });
-    return () => cancelAnimationFrame(raf);
+    ro.observe(el);
+    return () => { window.clearTimeout(t); ro.disconnect(); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [fs]);
 
-  /* 拉详情（当前 + 邻接预取） */
+  /* 当前短剧 + 下一部短剧展开成逐集滑片：
+     往下滑 = 本剧下一集；滑完最后一集才是下一部的第 1 集。
+     展开只会往后插滑片，所以当前这一屏不会因为展开而错位。 */
   useEffect(() => {
-    let alive = true;
-    const need = [videoIds[index], videoIds[index + 1], videoIds[index - 1]].filter(Boolean);
+    if (kind !== "video") return;
+    const list = deckRef.current;
+    const ids = [list[index]?.id, list[index + 1]?.id].filter((x): x is number => !!x);
+    const fresh = ids.filter((id) => !expandedRef.current.has(id));
+    if (!fresh.length) return;
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      fresh.forEach((id) => next.add(id));
+      return next;
+    });
+  }, [index, deck, kind]);
+
+  /* 拉详情（当前 + 后两部预取 + 前一部）：拿到剧集列表才能把短剧展开成逐集滑片 */
+  useEffect(() => {
+    if (kind === "post") return;
+    const vids = vidsRef.current;
+    const pos = vids.indexOf(curId);
+    const need = [pos, pos + 1, pos + 2, pos - 1]
+      .filter((p) => p >= 0 && p < vids.length)
+      .map((p) => vids[p]);
     need.forEach((id) => {
-      if (details[id]) return;
-      api.video(id).then((d) => { if (alive) setDetails((m) => ({ ...m, [id]: d })); }).catch(() => {});
+      if (detailsRef.current[id] || detailReq.current.has(id)) return;
+      detailReq.current.add(id);
+      api.video(id)
+        .then((d) => setDetails((m) => (m[id] ? m : { ...m, [id]: d })))
+        .catch(() => {})
+        .finally(() => { detailReq.current.delete(id); });
     });
-    return () => { alive = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [index, videoIds]);
+  }, [curId, idsKey, kind]);
 
   /* 吃瓜帖子：直接拿帖子详情（含 video_url） */
   useEffect(() => {
     if (kind !== "post") return;
     let alive = true;
-    [videoIds[index], videoIds[index + 1], videoIds[index - 1]].filter(Boolean).forEach((id) => {
-      if (posts[id]) return;
-      api.post(id).then((p) => { if (alive) setPosts((m) => ({ ...m, [id]: p })); }).catch(() => {});
-    });
+    [deckRef.current[index]?.id, deckRef.current[index + 1]?.id, deckRef.current[index - 1]?.id]
+      .filter((id): id is number => !!id)
+      .forEach((id) => {
+        if (posts[id]) return;
+        api.post(id).then((p) => { if (alive) setPosts((m) => ({ ...m, [id]: p })); }).catch(() => {});
+      });
     return () => { alive = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [kind, index, videoIds]);
+  }, [kind, index, idsKey]);
 
-  /* 拉播放地址 */
-  useEffect(() => {
-    if (!curId) return;
-    if (playUrls[playKey]) return;
-    let alive = true;
-    api.play(curId, curEp)
+  /* 拉播放地址：当前集失败要报错提示，预取失败静默 */
+  const fetchPlay = useCallback((id: number, ep: number, report: boolean) => {
+    if (!id) return;
+    const key = `${id}:${ep}`;
+    if (playUrlsRef.current[key] || playReq.current.has(key)) return;
+    playReq.current.add(key);
+    api.play(id, ep)
       .then((info) => {
-        if (!alive) return;
         if (!info?.video_url) throw new Error("暂无播放地址");
-        setPlayUrls((m) => ({ ...m, [playKey]: info.video_url }));
-        addHistory(curId, curEp);
+        setPlayUrls((m) => (m[key] ? m : { ...m, [key]: info.video_url }));
       })
-      .catch((e) => { if (alive) setErr((e as Error).message || "取播放地址失败"); });
-    return () => { alive = false; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [curId, curEp, playTry]);
+      .catch((e) => { if (report) setErr((e as Error).message || "取播放地址失败"); })
+      .finally(() => { playReq.current.delete(key); });
+  }, []);
+
+  useEffect(() => { fetchPlay(curId, curEp, true); }, [curId, curEp, playTry, fetchPlay]);
+
+  /* 切到哪一集就把观看进度记到哪一集（预取不会触发，历史不会被带到没看的集） */
+  useEffect(() => {
+    if (!active || kind === "post" || !curId) return;
+    addHistory(curId, curEp);
+  }, [active, kind, curId, curEp, addHistory]);
+
+  /* 预取下一集：滑下去立刻能播，不用等接口 */
+  useEffect(() => {
+    if (!active) return;
+    const nx = deckRef.current[index + 1];
+    if (nx) fetchPlay(nx.id, nx.ep, false);
+  }, [index, active, fetchPlay]);
 
   /* 切换条目/集数时重置播放与缩放状态 */
   useEffect(() => {
@@ -385,16 +571,9 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     setZoom({ scale: 1, x: 0, y: 0, gesturing: false });
   }, [playKey]);
 
-  /* 进出全屏时复位双指缩放并校准滚动条位置 */
+  /* 进出全屏时复位双指缩放（scrollTop 的对齐交给上面的 layout effect） */
   useEffect(() => {
     setZoom({ scale: 1, x: 0, y: 0, gesturing: false });
-    if (!fs && boxRef.current) {
-      const el = boxRef.current;
-      requestAnimationFrame(() => {
-        el.scrollTop = index * (el.clientHeight || 1);
-      });
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fs]);
 
   /* 音量/静音同步 */
@@ -759,8 +938,13 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   };
 
   const pickEp = (ep: number) => {
-    setEpMap((m) => ({ ...m, [curId]: ep }));
     setPanel(null);
+    setAnchor((m) => (m[curId] === ep ? m : { ...m, [curId]: ep }));
+    const hit = deck.findIndex((s) => s.id === curId && s.ep === ep);
+    if (hit >= 0) { jumpTo(hit); return; }
+    // 详情还没到：先记下目标集，剧集展开后当前滑片会自动落回这一集
+    setExpanded((prev) => (prev.has(curId) ? prev : new Set(prev).add(curId)));
+    setSlide({ id: curId, ep });
   };
 
   const likeCount = useMemo(() => {
@@ -793,11 +977,21 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
       <div ref={boxRef} onScroll={onScroll}
         className={`absolute inset-y-0 left-0 no-bar ${fs ? "overflow-hidden" : "overflow-y-scroll snap-y snap-mandatory overscroll-y-contain"}`}
         style={{ right: isDesktop && panel ? 372 : 0, transition: "right .3s cubic-bezier(.2,0,0,1)" }}>
-        {videoIds.map((vid, i) => {
+        {deck.map((sl, i) => {
           const isActive = i === index;
+          const vid = sl.id;
+          /* 一部剧展开后滑片可能有上百屏：只在当前屏附近真正渲染内容，
+             远处的屏用一个等高空片占位，滚动贴合与高度都不受影响。 */
+          if (Math.abs(i - index) > RENDER_RADIUS) {
+            return <section key={`${sl.id}:${sl.ep}`} aria-hidden data-video={sl.id} data-ep={sl.ep}
+              style={fs ? { display: "none" } : undefined}
+              className="w-full h-full snap-start snap-always" />;
+          }
           return (
             <section
-              key={vid}
+              key={`${sl.id}:${sl.ep}`}
+              data-video={sl.id}
+              data-ep={sl.ep}
               style={!isActive && fs ? { display: "none" } : undefined}
               className={`relative w-full h-full snap-start snap-always ${fs && isActive ? "" : "overflow-hidden"}`}>
               {isActive && playUrl ? (
@@ -836,7 +1030,11 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                       onPlaying={() => { setPaused(false); setWaiting(false); setErr(""); }}
                       onPause={() => setPaused(true)}
                       onWaiting={() => setWaiting(true)}
-                      onEnded={() => { const next = episodes.find((e) => e.ep_num === curEp + 1); if (next) pickEp(next.ep_num); }}
+                      onEnded={() => {
+                        // 播完自动接下一集（不跨剧，跨剧靠用户下滑）
+                        const nx = deckRef.current[indexRef.current + 1];
+                        if (nx && nx.id === curId) go(1);
+                      }}
                       onError={(m) => setErr(m)}
                     />
                   </div>
@@ -959,7 +1157,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                 </div>
               ) : (
                 <div className="absolute inset-0">
-                  <Img src={cards[vid]?.cover || posts[vid]?.cover || details[vid]?.cover || (isActive ? detail?.cover : "") || ""} eager={Math.abs(i - index) <= 1} />
+                  <Img src={posts[vid]?.cover || details[vid]?.cover || ""} eager={Math.abs(i - index) <= 1} />
                   <div className="absolute inset-0" style={{ background: "rgba(0,0,0,.25)" }} />
                 </div>
               )}
@@ -1044,13 +1242,18 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                   <div className="desktop-context-header">
                     <button onClick={onBack} aria-label="返回"><IBack size={17} /></button>
                     <span>{title}</span>
-                    <small>{index + 1} / {videoIds.length}</small>
+                    <small>
+                      {epCount > 1 ? `第 ${curEp}/${epCount} 集 · ` : ""}
+                      {posInVideos + 1} / {videoIds.length}
+                    </small>
                   </div>
                 ) : (
                   <div className="absolute inset-x-0 z-20 flex items-center gap-2 px-2.5" style={{ top: "calc(var(--sat, 0px) + 8px)", paddingRight: 148 }}>
                     <button onClick={onBack} aria-label="返回" className="hg-chip w-9 h-9 rounded-full flex items-center justify-center pressable elev-1"><IBack size={20} /></button>
                     <span className="text-[14.5px] font-semibold hg-ink hg-ov-shadow truncate">{title}</span>
-                    <span className="ml-auto px-2 py-0.5 rounded-full hg-chip text-[11px] font-semibold" style={{ color: "rgba(255,255,255,.9)" }}>{index + 1} / {videoIds.length}</span>
+                    <span className="ml-auto px-2 py-0.5 rounded-full hg-chip text-[11px] font-semibold" style={{ color: "rgba(255,255,255,.9)" }}>
+                      {epCount > 1 ? `第 ${curEp}/${epCount} 集` : `${posInVideos + 1} / ${videoIds.length}`}
+                    </span>
                   </div>
                 )
               ) : null}
@@ -1083,13 +1286,17 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
               {!fs && isDesktop && (
               <div className="absolute z-20 flex flex-col items-center desktop-social">
                 <div className="desktop-browse-inline">
-                  <button onClick={() => go(-1)} disabled={index === 0} aria-label="上一个" title="上一个 ↑">
+                  <button onClick={() => go(-1)} disabled={index === 0} aria-label="上一集" title="上一集 ↑">
                     <IChevronUp size={19} strokeWidth={1.8} />
                   </button>
-                  <button onClick={() => go(1)} disabled={index >= videoIds.length - 1} aria-label="下一个" title="下一个 ↓">
+                  <button onClick={() => go(1)} disabled={index >= deck.length - 1} aria-label="下一集" title="下一集 ↓">
                     <IChevronDown size={19} strokeWidth={1.8} />
                   </button>
-                  <small>{String(index + 1).padStart(2, "0")} / {String(videoIds.length).padStart(2, "0")}</small>
+                  <small>
+                    {epCount > 1
+                      ? `${curEp} / ${epCount}`
+                      : `${String(posInVideos + 1).padStart(2, "0")} / ${String(videoIds.length).padStart(2, "0")}`}
+                  </small>
                 </div>
 
                 {kind === "video" && (
@@ -1195,8 +1402,8 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
           visible={active && !idle}
           seekEnabled={active && !controlsLocked}
           seekKey={playKey}
-          nextDisabled={!episodes.some((e) => e.ep_num === curEp + 1) && index >= videoIds.length - 1}
-          nextTitle={episodes.some((e) => e.ep_num === curEp + 1) ? "下一集 E" : "下一部 ↓"}
+          nextDisabled={index >= deck.length - 1}
+          nextTitle={deck[index + 1]?.id === curId ? "下一集 E" : "下一部 ↓"}
           onToggle={() => videoRef.current?.toggle()}
           onSeek={(t, source) => { videoRef.current?.seek(t, source); setTime(t); }}
           onSeekInteraction={(phase, input, target, pointerTarget) => videoRef.current?.trace(`seek.input.${phase}`, { input, target, pointer_target: pointerTarget })}
@@ -1207,11 +1414,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
           onLock={lockControls}
           onTheater={() => setTheater((v) => !v)}
           onFullscreen={toggleFull}
-          onNext={() => {
-            const nx = episodes.find((e) => e.ep_num === curEp + 1);
-            if (nx) pickEp(nx.ep_num);
-            else go(1);
-          }}
+          onNext={() => go(1)}
         />
       )}
 

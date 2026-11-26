@@ -9,6 +9,7 @@
     "build": "tsc --noEmit && tsc --project tsconfig.tests.json && vite build",
     "preview": "vite preview",
     "test:playback": "node scripts/test-playback.mjs",
+    "test:feed": "node scripts/test-feed-deck.mjs",
     "test:api-loading": "node scripts/test-api-loading.mjs",
     "tauri": "tauri",
     "app:dev": "tauri dev",
